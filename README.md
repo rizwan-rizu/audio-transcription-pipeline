@@ -20,7 +20,7 @@ pip install -r requirements.txt
 
 # Make a test recording (macOS has text-to-speech built in; this also produces an AIFF file,
 # which shows that format handling is not limited to WAV/MP3)
-say -o samples/sample.aiff "Hello, this is a short test of the transcription pipeline."
+say -o samples/sample.aiff "One day the Hare laughed at the short feet and slow speed of the Tortoise. The Tortoise replied: You may be as fast as the wind, but I will beat you in a race! The Hare thought this idea was impossible and he agreed to the proposal. It was agreed that the Fox should choose the course and decide the end. The day for the race came, and the Tortoise and Hare started together. The Tortoise never stopped for a moment, walking slowly but steadily, right to the end of the course. The Hare ran fast and stopped to lie down for a rest. But he fell fast asleep. Eventually, he woke up and ran as fast as he could. But when he reached the end, he saw the Tortoise there already, sleeping comfortably after her effort."
 
 # Command line
 python transcribe.py samples/sample.aiff
@@ -100,10 +100,13 @@ Whisper processes audio in 30-second windows, so length is really two problems: 
 - *Model:* voice activity detection (Silero VAD, built into faster-whisper) skips silence. That saves compute and reduces Whisper's tendency to invent text during silent stretches. `CONDITION_ON_PREVIOUS_TEXT` can be switched off if a long file falls into a repetition loop.
 - *Service:* an HTTP request should not stay open for an hour of audio. The sync endpoint is capped (120 s by default) and tells the client to use `/v1/jobs` instead. Jobs report progress as segments come out of the model, because faster-whisper yields segments lazily rather than all at the end.
 
-**4. Bounded concurrency and back-pressure.**
+**4. Two endpoints instead of one.**
+Short clips go to `/v1/transcribe` and get the transcript straight back. Anything long goes to `/v1/jobs`. I thought about a single endpoint that decides for itself based on file length, but then the response would sometimes be a transcript and sometimes a job ID, so every client would need to handle both anyway. Two endpoints keep each response predictable. `/v1/jobs` works for any length, so if a client doesn't know how long its file is, that's the safe choice. Long term I'd move to a single async endpoint with webhooks (see "API" below), with the sync endpoint kept only as a shortcut for very short clips.
+
+**5. Bounded concurrency and back-pressure.**
 Transcription is CPU/GPU-bound, so running more of them at once than the hardware can handle just makes every one slower. A single semaphore (`WORKERS`, default 1) bounds model use for both sync requests and background jobs. Uploads stream to disk in 1 MB chunks instead of being held in memory. When the queue is full (`MAX_QUEUE_SIZE`), new work gets `429` with `Retry-After` instead of being accepted and then timing out. Work that has already been accepted is never dropped.
 
-**5. Failures: permanent vs transient.**
+**6. Failures: permanent vs transient.**
 Bad input is rejected *before* queueing, while the client is still connected. In the worker:
 - **Permanent errors** (corrupt or invalid audio): fail immediately. Retrying gives the same result.
 - **Anything else** (model crash, memory, I/O): retried with exponential backoff (2 s, 4 s, …) up to `MAX_ATTEMPTS`. After that the job is `failed` but marked `retryable`, and `POST /v1/jobs/{id}/retry` re-runs it.
@@ -111,10 +114,10 @@ Bad input is rejected *before* queueing, while the client is still connected. In
 
 I treat unknown errors as transient on purpose: retrying a broken job wastes a couple of attempts, while giving up on a recoverable job loses work.
 
-**6. Storage.**
+**7. Storage.**
 Local disk, laid out the way production would be: `audio.*` (→ object storage), `job.json` (→ database row), `transcript.json` (→ database or object storage). Job records are written atomically (temp file plus rename), so a crash never leaves a half-written record behind. Synchronous requests keep no audio. Job IDs are validated before being used in paths, which blocks path traversal.
 
-**7. Output built for downstream use.**
+**8. Output built for downstream use.**
 The transcript is cleaned (whitespace, empty segments), timestamps are kept sane (never negative, end ≥ start, within the file), and each segment carries `low_confidence`. That flag reuses the thresholds Whisper applies internally (`avg_logprob < -1.0` or `no_speech_prob > 0.6`), so a downstream step can send doubtful lines for review instead of trusting every line equally. JSON for systems, SRT for subtitles, TXT for search and LLM input.
 
 ## Scaling this to production
@@ -137,6 +140,8 @@ The code above runs on one machine. The states and rules stay the same at scale;
 - No accuracy evaluation yet. Next step: a small labelled set covering accents, noise and formats, tracking word error rate (WER) whenever the model or settings change.
 - CPU-only by default. `WHISPER_DEVICE=cuda` with `WHISPER_COMPUTE_TYPE=float16` on a GPU machine, and `WHISPER_MODEL=small` or larger for better accuracy.
 - No auth on the API.
+- FFmpeg parses files from untrusted users. In production I'd restrict accepted formats to the ones actually needed and run decoding in an isolated worker.
+- The low-confidence thresholds are Whisper's defaults. They should be tuned on real recordings.
 
 ## Configuration
 
