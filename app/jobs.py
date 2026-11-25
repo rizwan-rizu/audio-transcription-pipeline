@@ -94,6 +94,8 @@ class JobManager:
         self._probe = probe
         self._queue: "queue.Queue[str]" = queue.Queue()
         self._record_lock = threading.Lock()  # guards read-modify-write of job records
+        self._reserve_lock = threading.Lock()  # guards queue-place reservations
+        self._reserved = 0  # uploads in progress that already hold a queue place
         self.slots = threading.BoundedSemaphore(settings.workers)
         self._stop = threading.Event()
         self._threads: list = []
@@ -144,33 +146,49 @@ class JobManager:
         language: Optional[str] = None,
         word_timestamps: bool = False,
     ) -> Job:
-        # The limit applies to new work only. Jobs already accepted (retries,
-        # recovered jobs) are never dropped.
-        if self._queue.qsize() >= self._settings.max_queue_size:
-            raise BusyError("Too many jobs waiting. Try again shortly.")
-
+        # Reserve a place in the queue BEFORE saving the upload. Saving and
+        # validating take time, and without a reservation many uploads arriving
+        # together would all see a short queue and all get in.
+        self._reserve_queue_place()
         job_id = uuid.uuid4().hex
         audio_path = self._storage.audio_path(job_id, safe_suffix(filename))
         try:
-            self._storage.save_upload(upload, audio_path, self._settings.max_upload_bytes)
-            # Reject bad input now, while the client is still connected, rather
-            # than accepting a job that is bound to fail.
-            info = self._probe(audio_path, max_duration_s=self._settings.max_duration_s)
-        except BaseException:
-            self._storage.delete_job(job_id)
-            raise
+            try:
+                self._storage.save_upload(upload, audio_path, self._settings.max_upload_bytes)
+                # Reject bad input now, while the client is still connected, rather
+                # than accepting a job that is bound to fail.
+                info = self._probe(audio_path, max_duration_s=self._settings.max_duration_s)
+            except BaseException:
+                self._storage.delete_job(job_id)
+                raise
 
-        job = Job(
-            id=job_id,
-            filename=filename,
-            audio_path=str(audio_path),
-            language=language,
-            word_timestamps=word_timestamps,
-            duration_s=info.duration_s,
-        )
-        self._storage.save_job(job.to_dict())
-        self._queue.put(job_id)
-        return job
+            job = Job(
+                id=job_id,
+                filename=filename,
+                audio_path=str(audio_path),
+                language=language,
+                word_timestamps=word_timestamps,
+                duration_s=info.duration_s,
+            )
+            self._storage.save_job(job.to_dict())
+            self._queue.put(job_id)
+            return job
+        finally:
+            # On success the queue itself now counts the job; on failure the
+            # place is simply given back.
+            self._release_queue_place()
+
+    def _reserve_queue_place(self) -> None:
+        # The limit applies to new work only. Jobs already accepted (retries,
+        # recovered jobs) are never dropped.
+        with self._reserve_lock:
+            if self._queue.qsize() + self._reserved >= self._settings.max_queue_size:
+                raise BusyError("Too many jobs waiting. Try again shortly.")
+            self._reserved += 1
+
+    def _release_queue_place(self) -> None:
+        with self._reserve_lock:
+            self._reserved -= 1
 
     def get_job(self, job_id: str) -> Optional[Job]:
         if not is_valid_job_id(job_id):

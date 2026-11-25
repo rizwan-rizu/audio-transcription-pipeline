@@ -112,3 +112,44 @@ def test_unknown_or_malformed_job_id(settings):
     manager, _ = make_manager(settings)
     assert manager.get_job("../../etc/passwd") is None
     assert manager.get_job("f" * 32) is None
+
+
+def test_queue_limit_holds_for_uploads_arriving_together(settings):
+    # Regression: the limit used to be checked before the upload was saved and the
+    # job queued only after, so simultaneous uploads could all get past it.
+    import dataclasses
+    import threading
+
+    in_probe = threading.Event()
+    release = threading.Event()
+
+    def slow_probe(path, max_duration_s=None):
+        in_probe.set()
+        release.wait(5)
+        return fake_probe(path)
+
+    one_slot = dataclasses.replace(settings, max_queue_size=1)
+    manager, storage = make_manager(one_slot, probe=slow_probe)
+
+    first = threading.Thread(target=submit, args=(manager,))
+    first.start()
+    assert in_probe.wait(5)          # first upload is mid-validation, queue still empty
+    assert manager.queue_depth() == 0
+    with pytest.raises(BusyError):   # second upload must still be refused
+        submit(manager)
+    release.set()
+    first.join(5)
+    assert manager.queue_depth() == 1
+
+
+def test_failed_upload_gives_its_queue_place_back(settings):
+    import dataclasses
+
+    def bad_probe(path, max_duration_s=None):
+        raise InvalidAudioError("no audio stream")
+
+    one_slot = dataclasses.replace(settings, max_queue_size=1)
+    manager, _ = make_manager(one_slot, probe=bad_probe)
+    for _ in range(3):  # each failure must release its place, or the 2nd try would get 429
+        with pytest.raises(InvalidAudioError):
+            submit(manager)
