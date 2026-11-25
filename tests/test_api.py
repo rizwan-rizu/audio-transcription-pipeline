@@ -104,3 +104,13 @@ def test_full_queue_returns_429(settings):
 def test_unknown_job_returns_404(client):
     assert client.get("/v1/jobs/" + "f" * 32).status_code == 404
     assert client.get("/v1/jobs/not-a-job").status_code == 404
+
+
+def test_oversized_upload_rejected_from_content_length(settings):
+    small = dataclasses.replace(settings, max_upload_mb=1)
+    with TestClient(create_app(small, FakeTranscriber(), probe=fake_probe)) as c:
+        big = {"file": ("big.wav", b"x" * (2 * 1024 * 1024), "audio/wav")}
+        for path in ("/v1/transcribe", "/v1/jobs"):
+            r = c.post(path, files=big)
+            assert r.status_code == 413
+            assert r.json()["error"] == "UploadTooLargeError"

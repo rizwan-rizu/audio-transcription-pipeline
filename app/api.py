@@ -38,6 +38,9 @@ log = logging.getLogger(__name__)
 LANGUAGE_CODE = re.compile(r"^[a-z]{2,3}$")
 FORMAT_QUERY = Query("json", pattern="^(json|srt|txt)$", description="json, srt or txt")
 MEDIA_TYPES = {"srt": "application/x-subrip", "txt": "text/plain"}
+# Content-Length covers the whole multipart body (boundaries, headers, form fields),
+# not just the file, so allow a little room before rejecting on the header alone.
+MULTIPART_OVERHEAD = 64 * 1024
 
 # Our errors -> HTTP status codes. Order matters: most specific first.
 ERROR_STATUS = [
@@ -69,6 +72,26 @@ def create_app(
 
     app = FastAPI(title="Transcription Service", version="0.1.0", lifespan=lifespan)
     app.state.manager = manager
+
+    @app.middleware("http")
+    async def reject_oversized_uploads(request: Request, call_next):
+        # FastAPI receives the whole multipart body before a route runs, so a limit
+        # checked inside the route only applies after the client has sent every byte.
+        # Checking the declared size here rejects a too-large upload before the body
+        # is read. Uploads without a Content-Length (chunked) are still caught by the
+        # byte count in storage.save_upload.
+        if request.method == "POST":
+            declared = _declared_length(request)
+            if declared is not None and declared > settings.max_upload_bytes + MULTIPART_OVERHEAD:
+                exc = UploadTooLargeError(
+                    f"File is larger than the {settings.max_upload_mb} MB limit."
+                )
+                return JSONResponse(
+                    status_code=413,
+                    content={"error": type(exc).__name__, "detail": str(exc)},
+                    headers={"Connection": "close"},
+                )
+        return await call_next(request)
 
     @app.exception_handler(TranscriptionError)
     async def handle_known_errors(request: Request, exc: TranscriptionError):
@@ -145,6 +168,16 @@ def create_app(
             raise HTTPException(409, str(exc)) from exc
 
     return app
+
+
+def _declared_length(request: Request) -> Optional[int]:
+    value = request.headers.get("content-length")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None  # malformed header: let the server and the byte count deal with it
 
 
 def _check_language(language: Optional[str]) -> None:
